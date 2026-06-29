@@ -1,0 +1,238 @@
+/**
+ * Prisma Schema — Production SaaS Starter
+ *
+ * Multi-tenant database design using row-level isolation:
+ * - Every tenant-scoped table includes `organizationId`
+ * - Prisma queries always filter by `organizationId`
+ * - No separate schemas/databases per tenant (cost-effective at scale)
+ *
+ * Models:
+ *   User           — Account credentials and profile
+ *   Organization   — Tenant workspace (multi-tenancy root)
+ *   Member         — User <-> Organization membership (RBAC)
+ *   Subscription   — Stripe billing data
+ *   ApiKey         — Programmatic access tokens
+ *   AuditLog       — Security and compliance trail
+ *   Invitation     — Pending team invitations
+ *   RefreshToken   — JWT refresh token storage
+ */
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/**
+ * User — Central identity for authentication.
+ * One user can belong to multiple organizations via Member.
+ */
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String?
+  name          String?
+  avatarUrl     String?
+  emailVerified Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // OAuth profile data
+  googleId   String? @unique
+  githubId   String? @unique
+
+  // Relations
+  members       Member[]
+  ownedOrgs     Organization[] @relation("OrganizationOwner")
+  apiKeys       ApiKey[]       @relation("ApiKeyCreator")
+  invitations   Invitation[]   @relation("InvitationSender")
+  auditLogs     AuditLog[]
+  refreshTokens RefreshToken[]
+
+  @@index([email])
+  @@index([googleId])
+  @@index([githubId])
+  @@map("users")
+}
+
+/**
+ * Organization — The tenant entity.
+ * All tenant-scoped resources belong to an organization.
+ */
+model Organization {
+  id          String   @id @default(uuid())
+  name        String
+  slug        String   @unique
+  description String?
+  logoUrl     String?
+  website     String?
+  billingEmail String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Plan & billing
+  plan               String   @default("FREE") // FREE, PRO, TEAM, ENTERPRISE
+  subscriptionStatus String?  // active, trialing, past_due, canceled
+  stripeCustomerId   String?  @unique
+  subscriptionId     String?  @unique
+
+  // Relations
+  owner      User         @relation("OrganizationOwner", fields: [ownerId], references: [id])
+  ownerId    String
+  members    Member[]
+  apiKeys    ApiKey[]
+  auditLogs  AuditLog[]
+  invitations Invitation[]
+
+  // Multi-tenancy index: all queries filter by organizationId
+  @@index([slug])
+  @@index([stripeCustomerId])
+  @@index([subscriptionId])
+  @@map("organizations")
+}
+
+/**
+ * Member — User membership in an organization.
+ * The role field enforces RBAC.
+ */
+model Member {
+  id        String   @id @default(uuid())
+  role      String   @default("MEMBER") // OWNER, ADMIN, MEMBER, VIEWER
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Composite unique: one membership per user per org
+  userId         String
+  organizationId String
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@index([userId])
+  @@map("members")
+}
+
+/**
+ * Subscription — Stripe subscription mirror.
+ * Kept in sync via webhook events.
+ */
+model Subscription {
+  id                     String   @id @default(uuid())
+  status                 String   @default("active") // active, canceled, past_due, trialing, paused
+  plan                   String   @default("FREE")    // FREE, PRO, TEAM, ENTERPRISE
+  currentPeriodStart     DateTime
+  currentPeriodEnd       DateTime
+  cancelAtPeriodEnd      Boolean  @default(false)
+  canceledAt             DateTime?
+  seats                  Int      @default(1)
+  stripeSubscriptionId   String   @unique
+  stripeCustomerId       String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  organizationId String @unique
+
+  @@index([stripeSubscriptionId])
+  @@index([organizationId])
+  @@map("subscriptions")
+}
+
+/**
+ * ApiKey — Secure programmatic access tokens.
+ * Only the prefix and hash are stored; the full key is shown once on creation.
+ */
+model ApiKey {
+  id        String    @id @default(uuid())
+  name      String
+  keyHash   String    // SHA-256 hash of the full key
+  prefix    String    // First 8 chars of random part (for display)
+  scopes    String[]  // read, write, admin
+  lastUsedAt DateTime?
+  createdAt DateTime  @default(now())
+  expiresAt DateTime?
+
+  organizationId String
+  createdById    String
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User         @relation("ApiKeyCreator", fields: [createdById], references: [id])
+
+  @@index([organizationId])
+  @@index([keyHash])
+  @@map("api_keys")
+}
+
+/**
+ * AuditLog — Security and compliance event trail.
+ * Immutable records of all significant actions.
+ */
+model AuditLog {
+  id          String   @id @default(uuid())
+  action      String   // e.g., USER_LOGIN, MEMBER_INVITED, BILLING_UPDATED
+  description String?
+  metadata    Json?    // Flexible structured data
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  organizationId String
+  userId         String?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([action])
+  @@index([userId])
+  @@map("audit_logs")
+}
+
+/**
+ * Invitation — Pending team member invitations.
+ * Expires after 7 days. Accepted invitations convert to Member records.
+ */
+model Invitation {
+  id     String @id @default(uuid())
+  email  String
+  role   String @default("MEMBER") // ADMIN, MEMBER, VIEWER
+  status String @default("PENDING") // PENDING, ACCEPTED, EXPIRED, REVOKED
+  token  String @unique // Secure token for accepting the invite
+
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  acceptedAt DateTime?
+
+  organizationId String
+  invitedById    String
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invitedBy    User         @relation("InvitationSender", fields: [invitedById], references: [id])
+
+  @@index([organizationId, status])
+  @@index([token])
+  @@map("invitations")
+}
+
+/**
+ * RefreshToken — JWT refresh token storage for secure token rotation.
+ * Tokens are hashed before storage. Old tokens are cleaned up periodically.
+ */
+model RefreshToken {
+  id        String   @id @default(uuid())
+  tokenHash String   // bcrypt hash of the refresh token
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
+}
