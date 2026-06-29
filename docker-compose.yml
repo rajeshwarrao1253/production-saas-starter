@@ -1,0 +1,133 @@
+version: "3.8"
+
+# Production SaaS Starter — Docker Compose
+# Starts: PostgreSQL, Redis, API server, web dev server, MailHog
+# Usage: docker-compose up -d
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — Primary database with multi-tenancy support
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: saas-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: saas_user
+      POSTGRES_PASSWORD: saas_pass
+      POSTGRES_DB: saas_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saas_user -d saas_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - saas-network
+
+  # ---------------------------------------------------------------------------
+  # Redis — Session store, cache, and rate-limiting backend
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: saas-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - saas-network
+
+  # ---------------------------------------------------------------------------
+  # MailHog — Local email testing (SMTP + Web UI)
+  # ---------------------------------------------------------------------------
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: saas-mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP server
+      - "8025:8025"   # Web UI
+    networks:
+      - saas-network
+
+  # ---------------------------------------------------------------------------
+  # API Server — Node.js + Express
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: development
+    container_name: saas-api
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      NODE_ENV: development
+      PORT: 4000
+      DATABASE_URL: postgresql://saas_user:saas_pass@db:5432/saas_db
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-in-production}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev-refresh-secret-change-in-production}
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_FROM: noreply@localhost
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      FRONTEND_URL: http://localhost:5173
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+    volumes:
+      - ./apps/api:/app
+      - /app/node_modules
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+    networks:
+      - saas-network
+    command: sh -c "npx prisma migrate dev && npx tsx watch src/index.ts"
+
+  # ---------------------------------------------------------------------------
+  # Web App — React + Vite dev server
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: development
+    container_name: saas-web
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:4000
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+    depends_on:
+      - api
+    networks:
+      - saas-network
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  saas-network:
+    driver: bridge
